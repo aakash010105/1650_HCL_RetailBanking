@@ -1,0 +1,189 @@
+customer_id,account_id,last_txn_ts,product_type,dormant_flag
+C010,A0010,,,Dormant
+C011,A0011,,,Dormant
+C016,A0016,,,Dormant
+C019,A0019,,,Dormant
+C023,A0023,,,Dormant
+C025,A0025,,,Dormant
+C026,A0026,,,Dormant
+C031,A0031,,,Dormant
+C032,A0032,,,Dormant
+C034,A0034,,,Dormant
+C037,A0037,,,Dormant
+C038,A0038,,,Dormant
+C043,A0043,,,Dormant
+C044,A0044,,,Dormant
+C045,A0045,,,Dormant
+C046,A0046,,,Dormant
+C051,A0051,,,Dormant
+C052,A0052,,,Dormant
+C055,A0055,,,Dormant
+C056,A0056,,,Dormant
+C066,A0066,,,Dormant
+C071,A0071,,,Dormant
+C075,A0075,,,Dormant
+C083,A0083,,,Dormant
+C084,A0084,,,Dormant
+C085,A0085,,,Dormant
+C086,A0086,,,Dormant
+C091,A0091,,,Dormant
+C092,A0092,,,Dormant
+C096,A0096,,,Dormant
+C097,A0097,,,Dormant
+C099,A0099,,,Dormant
+C100,A0100,,,Dormant
+C103,A0103,,,Dormant
+C105,A0105,,,Dormant
+C112,A0112,,,Dormant
+C113,A0113,,,Dormant
+C118,A0118,,,Dormant
+C119,A0119,,,Dormant
+C123,A0123,,,Dormant
+C134,A0134,,,Dormant
+C137,A0137,,,Dormant
+C141,A0141,,,Dormant
+C146,A0146,,,Dormant
+C149,A0149,,,Dormant
+C150,A0150,,,Dormant
+C159,A0159,,,Dormant
+C160,A0160,,,Dormant
+C162,A0162,,,Dormant
+C163,A0163,,,Dormant
+C166,A0166,,,Dormant
+C167,A0167,,,Dormant
+C168,A0168,,,Dormant
+C169,A0169,,,Dormant
+C170,A0170,,,Dormant
+C171,A0171,,,Dormant
+C172,A0172,,,Dormant
+C173,A0173,,,Dormant
+C174,A0174,,,Dormant
+C175,A0175,,,Dormant
+C176,A0176,,,Dormant
+C177,A0177,,,Dormant
+C178,A0178,,,Dormant
+C179,A0179,,,Dormant
+C180,A0180,,,Dormant
+C181,A0181,,,Dormant
+C182,A0182,,,Dormant
+C183,A0183,,,Dormant
+C184,A0184,,,Dormant
+C185,A0185,,,Dormant
+C186,A0186,,,Dormant
+C187,A0187,,,Dormant
+C1172,A1172,,,Dormant
+C1175,A1175,,,Dormant
+C1180,A1180,,,Dormant
+C1181,A1181,,,Dormant
+C1183,A1183,,,Dormant
+C1184,A1184,,,Dormant
+C1185,A1185,,,Dormant
+C2186,A2186,,,Dormant
+C2187,A2187,,,Dormant
+C2191,A2191,,,Dormant
+C2192,A2192,,,Dormant
+C2194,A2194,,,Dormant
+C2195,A2195,,,Dormant
+C2196,A2196,,,Dormant
+C2198,A2198,,,Dormant
+C3201,A3201,,,Dormant
+C3204,A3204,,,Dormant
+C3210,A3210,,,Dormant
+C4717,A4717,,,Dormant
+C4720,A4720,,,Dormant
+C4721,A4721,,,Dormant
+C5226,A5226,,,Dormant
+C5231,A5231,,,Dormant
+C5232,A5232,,,Dormant
+C6239,A6239,,,Dormant
+C6241,A6241,,,Dormant
+C7244,A7244,,,Dormant
+C7245,A7245,,,Dormant
+C7248,A7248,,,Dormant
+C089,A0089,2025-07-04 18:37:00,Savings Account,Dormant
+C138,A0138,2025-07-04 20:21:00,Savings Account,Dormant
+C030,A0030,2025-08-02 06:02:00,Savings Account,Dormant
+C3206,A3206,2025-08-24 01:49:00,Savings Account,Dormant
+C132,A0132,2025-08-31 02:23:00,Savings Account,Dormant
+C088,A0088,2025-09-26 21:44:00,Savings Account,Dormant
+C3202,A3202,2025-11-05 17:08:00,Savings Account,Dormant
+C133,A0133,2025-12-03 18:51:00,Savings Account,Dormant
+C120,A0120,2025-12-09 21:04:00,Fixed Deposit,Dormant
+C042,A0042,2025-12-10 00:36:00,Savings Account,Dormant
+C154,A0154,2025-12-15 02:06:00,Fixed Deposit,Dormant
+C063,A0063,2025-12-21 22:42:00,Fixed Deposit,Dormant
+C2189,A2189,2026-01-07 22:12:00,Fixed Deposit,Dormant
+C131,A0131,2026-01-10 03:09:00,Fixed Deposit,Dormant
+C035,A0035,2026-02-20 21:11:00,Fixed Deposit,Dormant
+C058,A0058,2026-02-26 04:40:00,Fixed Deposit,Dormant
+C2193,A2193,2026-02-28 21:23:00,Fixed Deposit,Dormant
+C029,A0029,2026-03-15 14:54:00,Fixed Deposit,Dormant
+C147,A0147,2026-03-24 08:48:00,Fixed Deposit,Dormant
+C7247,A7247,2026-04-04 02:09:00,Savings Account,Dormant
+C027,A0027,2026-04-04 13:07:00,Savings Account,Dormant
+C006,A0006,2026-04-09 04:07:00,Savings Account,Dormant
+C036,A0036,2026-05-07 07:42:00,Savings Account,Dormant
+C077,A0077,2026-05-11 18:23:00,Fixed Deposit,Dormant
+C2197,A2197,2026-05-13 10:13:00,Fixed Deposit,Dormant
+C6235,A6235,2026-05-28 06:44:00,Savings Account,Dormant
+C7251,A7251,2026-05-29 19:23:00,Fixed Deposit,Dormant
+C127,A0127,2026-06-05 01:44:00,Savings Account,Dormant
+C5233,A5233,2026-06-12 13:16:00,Fixed Deposit,Dormant
+C2199,A2199,2026-06-18 11:05:00,Fixed Deposit,Dormant
+C124,A0124,2026-06-18 23:39:00,Savings Account,Dormant
+C004,A0004,2026-06-30 06:36:00,Savings Account,Dormant
+C028,A0028,2025-07-10 18:28:00,Loan,High-Risk Dormant
+C087,A0087,2025-07-19 06:14:00,Loan,High-Risk Dormant
+C6234,A6234,2025-07-22 01:43:00,Loan,High-Risk Dormant
+C129,A0129,2025-07-28 11:39:00,Loan,High-Risk Dormant
+C5224,A5224,2025-08-16 21:25:00,Credit Card,High-Risk Dormant
+C3209,A3209,2025-08-25 14:17:00,Loan,High-Risk Dormant
+C107,A0107,2025-08-30 22:36:00,Credit Card,High-Risk Dormant
+C109,A0109,2025-09-13 20:09:00,Loan,High-Risk Dormant
+C116,A0116,2025-09-29 05:34:00,Loan,High-Risk Dormant
+C072,A0072,2025-10-01 00:40:00,Credit Card,High-Risk Dormant
+C074,A0074,2025-10-06 15:49:00,Loan,High-Risk Dormant
+C151,A0151,2025-10-20 22:22:00,Credit Card,High-Risk Dormant
+C1176,A1176,2025-11-02 18:02:00,Credit Card,High-Risk Dormant
+C122,A0122,2025-11-13 01:24:00,Credit Card,High-Risk Dormant
+C6237,A6237,2025-11-14 12:34:00,Credit Card,High-Risk Dormant
+C101,A0101,2025-11-22 16:46:00,Loan,High-Risk Dormant
+C012,A0012,2025-11-23 08:56:00,Credit Card,High-Risk Dormant
+C2188,A2188,2025-12-12 01:23:00,Credit Card,High-Risk Dormant
+C1178,A1178,2025-12-13 18:12:00,Credit Card,High-Risk Dormant
+C161,A0161,2025-12-15 09:57:00,Loan,High-Risk Dormant
+C015,A0015,2026-01-03 09:30:00,Credit Card,High-Risk Dormant
+C095,A0095,2026-01-08 02:28:00,Credit Card,High-Risk Dormant
+C164,A0164,2026-01-15 22:50:00,Credit Card,High-Risk Dormant
+C143,A0143,2026-01-18 12:12:00,Loan,High-Risk Dormant
+C005,A0005,2026-01-20 17:55:00,Loan,High-Risk Dormant
+C041,A0041,2026-01-25 15:07:00,Loan,High-Risk Dormant
+C153,A0153,2026-02-04 05:59:00,Credit Card,High-Risk Dormant
+C064,A0064,2026-02-05 23:55:00,Credit Card,High-Risk Dormant
+C5225,A5225,2026-02-12 07:16:00,Credit Card,High-Risk Dormant
+C076,A0076,2026-02-14 23:50:00,Credit Card,High-Risk Dormant
+C033,A0033,2026-02-15 15:42:00,Credit Card,High-Risk Dormant
+C165,A0165,2026-02-19 01:35:00,Loan,High-Risk Dormant
+C152,A0152,2026-03-02 18:02:00,Loan,High-Risk Dormant
+C081,A0081,2026-03-03 18:57:00,Credit Card,High-Risk Dormant
+C093,A0093,2026-03-11 07:05:00,Credit Card,High-Risk Dormant
+C3205,A3205,2026-03-13 10:01:00,Credit Card,High-Risk Dormant
+C104,A0104,2026-03-16 20:18:00,Loan,High-Risk Dormant
+C001,A0001,2026-03-24 02:42:00,Loan,High-Risk Dormant
+C5223,A5223,2026-04-05 12:28:00,Loan,High-Risk Dormant
+C136,A0136,2026-04-06 20:15:00,Credit Card,High-Risk Dormant
+C024,A0024,2026-04-08 19:38:00,Loan,High-Risk Dormant
+C148,A0148,2026-04-17 04:08:00,Credit Card,High-Risk Dormant
+C5227,A5227,2026-04-18 21:05:00,Loan,High-Risk Dormant
+C1182,A1182,2026-04-27 07:48:00,Loan,High-Risk Dormant
+C156,A0156,2026-04-27 17:01:00,Loan,High-Risk Dormant
+C114,A0114,2026-05-04 00:09:00,Credit Card,High-Risk Dormant
+C6243,A6243,2026-05-08 00:49:00,Loan,High-Risk Dormant
+C008,A0008,2026-05-10 01:41:00,Loan,High-Risk Dormant
+C007,A0007,2026-05-16 02:19:00,Loan,High-Risk Dormant
+C108,A0108,2026-05-22 00:19:00,Credit Card,High-Risk Dormant
+C5222,A5222,2026-05-24 04:53:00,Credit Card,High-Risk Dormant
+C1171,A1171,2026-05-25 20:03:00,Loan,High-Risk Dormant
+C5230,A5230,2026-06-15 23:52:00,Credit Card,High-Risk Dormant
+C065,A0065,2026-07-01 16:18:00,Loan,High-Risk Dormant
+C040,A0040,2026-07-07 07:36:00,Credit Card,High-Risk Dormant

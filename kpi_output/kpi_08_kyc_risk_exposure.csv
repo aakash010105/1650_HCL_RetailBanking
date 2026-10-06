@@ -1,0 +1,4 @@
+kyc_status,is_not_verified,txn_count,total_value,pct_count,pct_value
+Pending,True,77,7751629.0,29.5,30.69
+Rejected,True,86,8438413.0,32.95,33.41
+Verified,False,98,9068948.0,37.55,35.9

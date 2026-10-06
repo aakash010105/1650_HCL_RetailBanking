@@ -1,0 +1,9 @@
+batch_id,entity,source_file,received,passed,rejected,reject_pct,top_reasons
+day1-baseline,branches,branches.csv,102,97,5,4.9,CONFLICTING_DUPLICATE=4; DUPLICATE_RECORD=1
+day1-baseline,customers,customers.csv,257,240,17,6.61,INVALID_DOB=6; DUPLICATE_RECORD=6; MALFORMED_STRUCTURE=4
+day1-baseline,products,products_json.txt,114,105,9,7.89,CONFLICTING_DUPLICATE=6; NEGATIVE_PRICE=3
+day1-baseline,transactions,transactions.csv,940,647,293,31.17,MISSING_DIM=185; CONFLICTING_DUPLICATE=32; AMOUNT_BLANK=22
+day2-incremental,branches,branches_2.csv,2,2,0,0.0,
+day2-incremental,customers,customer_updates_2.csv,47,47,0,0.0,
+day2-incremental,products,products_2_json.txt,18,18,0,0.0,
+day2-incremental,transactions,transactions_2.csv,199,135,64,32.16,MISSING_DIM=38; CONFLICTING_DUPLICATE=6; AMOUNT_ZERO=5

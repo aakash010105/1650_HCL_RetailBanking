@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: RetailBank batch pipeline. Raw landing, event-driven registration, Glue batch job, Athena serving.
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+
+Resources:
+  # ------------------------------------------------------------ storage
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub retailbank-raw-${Env}-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub retailbank-lake-${Env}-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub retailbank-artifacts-${Env}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BatchControlTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub retailbank-${Env}-batch-control
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: batch_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: batch_id, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+
+  # ------------------------------------------------------------ event path
+  RawBatchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub retailbank-${Env}-raw-batch-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  RawBatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub retailbank-${Env}-raw-batch-events
+      VisibilityTimeout: 300
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RawBatchDLQ.Arn
+        maxReceiveCount: 5
+
+  ManifestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: manifest.json landed in the raw bucket
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref RawBucket]
+          object:
+            key: [{suffix: manifest.json}]
+      Targets:
+        - Id: raw-batch-queue
+          Arn: !GetAtt RawBatchQueue.Arn
+
+  RawBatchQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref RawBatchQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt RawBatchQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ManifestRule.Arn
+
+  # ------------------------------------------------------------ registrar (Lambda)
+  RegistrarRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      Policies:
+        - PolicyName: registrar
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub ${RawBucket.Arn}/*
+              - Effect: Allow
+                Action: [dynamodb:PutItem]
+                Resource: !GetAtt BatchControlTable.Arn
+              - Effect: Allow
+                Action: [states:StartExecution]
+                Resource: !Ref BatchStateMachine
+
+  RegistrarFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub retailbank-${Env}-registrar
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt RegistrarRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          CONTROL_TABLE: !Ref BatchControlTable
+          STATE_MACHINE_ARN: !Ref BatchStateMachine
+      Code:
+        ZipFile: |
+          import hashlib, json, os
+          import boto3
+
+          s3 = boto3.client("s3")
+          ddb = boto3.client("dynamodb")
+          sfn = boto3.client("stepfunctions")
+
+
+          def handler(event, _):
+              for rec in event["Records"]:
+                  detail = json.loads(rec["body"])["detail"]
+                  bucket, key = detail["bucket"]["name"], detail["object"]["key"]
+                  # Execution names stay reserved after a run, so each upload gets its own name
+                  # (bucket versioning gives a unique version-id per manifest upload).
+                  version = "".join(c for c in detail["object"].get("version-id", "v0") if c.isalnum())[:32]
+                  manifest = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+                  folder = key.rsplit("/", 1)[0]
+                  # Verify every landed file against the checksum in the manifest before any processing.
+                  for f in manifest["files"]:
+                      body = s3.get_object(Bucket=bucket, Key=f"{folder}/{f['key']}")["Body"].read()
+                      if hashlib.sha256(body).hexdigest() != f["sha256"]:
+                          raise ValueError(f"checksum mismatch: {f['key']}")
+                  bid = manifest["batch_id"]
+                  try:
+                      # Idempotency lock: a duplicate event for the same batch is skipped.
+                      ddb.put_item(
+                          TableName=os.environ["CONTROL_TABLE"],
+                          Item={"batch_id": {"S": bid}, "status": {"S": "RECEIVED"},
+                                "load_type": {"S": manifest["load_type"]}, "manifest_key": {"S": key}},
+                          ConditionExpression="attribute_not_exists(batch_id)",
+                      )
+                  except ddb.exceptions.ConditionalCheckFailedException:
+                      print(f"duplicate event for {bid}, skipped")
+                      continue
+                  sfn.start_execution(
+                      stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+                      name=f"{bid}-{version}",
+                      input=json.dumps({"batch_id": bid, "manifest_key": key}),
+                  )
+                  print(f"started {bid}")
+
+  RegistrarEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RawBatchQueue.Arn
+      FunctionName: !Ref RegistrarFunction
+      BatchSize: 1
+
+  # ------------------------------------------------------------ batch job (Glue Python shell)
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: batch-data
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawBucket.Arn
+                  - !Sub ${RawBucket.Arn}/*
+                  - !GetAtt LakeBucket.Arn
+                  - !Sub ${LakeBucket.Arn}/*
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt BatchControlTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
+
+  BatchGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub retailbank-${Env}-batch
+      Role: !Ref GlueRole
+      GlueVersion: "3.0"
+      MaxCapacity: 1.0
+      MaxRetries: 0
+      Timeout: 60
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub s3://${ArtifactsBucket}/glue/pipeline_runner.py
+      DefaultArguments:
+        "--additional-python-modules": "pandas==2.2.3,pyarrow==19.0.0,duckdb==1.1.3"
+        "--RAW_BUCKET": !Ref RawBucket
+        "--LAKE_BUCKET": !Ref LakeBucket
+        "--CONTROL_TABLE": !Ref BatchControlTable
+        "--ARTIFACTS_BUCKET": !Ref ArtifactsBucket
+
+  # ------------------------------------------------------------ orchestration (Step Functions)
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-glue
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${BatchGlueJob}
+              - Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForGlueJobRunRule
+
+  BatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub retailbank-${Env}-batch
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "RunBatchGlueJob",
+          "States": {
+            "RunBatchGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${BatchGlueJob}",
+                "Arguments": {
+                  "--BATCH_ID.$": "$.batch_id",
+                  "--MANIFEST_KEY.$": "$.manifest_key"
+                }
+              },
+              "Retry": [{
+                "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 20,
+                "BackoffRate": 1.0
+              }],
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "BatchFailed"}],
+              "End": true
+            },
+            "BatchFailed": {
+              "Type": "Fail",
+              "Error": "BatchFailed",
+              "Cause": "Glue batch job failed. See the batch_control table for the error."
+            }
+          }
+        }
+
+  # ------------------------------------------------------------ serving (Athena)
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub retailbank-${Env}
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${LakeBucket}/athena-results/
+
+Outputs:
+  RawBucket:
+    Value: !Ref RawBucket
+  LakeBucket:
+    Value: !Ref LakeBucket
+  ArtifactsBucket:
+    Value: !Ref ArtifactsBucket
+  BatchControlTable:
+    Value: !Ref BatchControlTable
+  BatchStateMachineArn:
+    Value: !Ref BatchStateMachine
+  BatchGlueJob:
+    Value: !Ref BatchGlueJob
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup

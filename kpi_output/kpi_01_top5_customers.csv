@@ -1,0 +1,6 @@
+rnk,customer_id,customer_name,account_id,net_volume,txn_count
+1,C018,Customer_18,A0018,558063.0,5
+2,C4718,Customer_90,A4718,552422.0,3
+3,C152,Customer_152,A0152,434678.0,3
+4,C054,Customer_54,A0054,421561.0,3
+5,C060,Customer_60,A0060,387593.0,3

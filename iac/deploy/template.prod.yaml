@@ -1,0 +1,1133 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  RetailBank batch pipeline, production. Immutable raw landing (Object Lock), customer-managed KMS
+  encryption, event-driven registration, Glue batch job, Step Functions orchestration, Glue catalog
+  tables for the lake, Athena workgroup, and alerting. Resources are retained on stack deletion.
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+    AllowedValues: [prod]
+  RawRetentionDays:
+    Type: Number
+    Default: 2555
+    MinValue: 1
+    Description: Object Lock default retention for raw batch files (2555 = 7 years).
+  RetentionMode:
+    Type: String
+    Default: GOVERNANCE
+    AllowedValues: [GOVERNANCE, COMPLIANCE]
+    Description: >
+      GOVERNANCE lets authorised admins remove locked objects with a bypass permission.
+      COMPLIANCE cannot be shortened or removed by anyone, including the root user. Confirm with compliance before choosing it.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for pipeline alerts. Leave empty to subscribe later.
+  LogRetentionDays:
+    Type: Number
+    Default: 365
+    AllowedValues: [90, 180, 365, 731, 1827, 2557]
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ------------------------------------------------------------ encryption
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: RetailBank prod data encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: EventBridgeAndAlarmsUseKey
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
+            Action: [kms:Decrypt, kms:GenerateDataKey*]
+            Resource: "*"
+          - Sid: CloudWatchLogsUseKey
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action: [kms:Encrypt*, kms:Decrypt*, kms:ReEncrypt*, kms:GenerateDataKey*, kms:Describe*]
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/retailbank-${Env}-data
+      TargetKeyId: !Ref DataKey
+
+  # ------------------------------------------------------------ storage
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub retailbank-logs-${Env}-${AWS::AccountId}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 400
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt LogsBucket.Arn, !Sub "${LogsBucket.Arn}/*"]
+            Condition:
+              Bool: {aws:SecureTransport: "false"}
+          - Sid: S3ServerAccessLogs
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${LogsBucket.Arn}/s3-access/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub retailbank-raw-${Env}-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: !Ref RetentionMode
+            Days: !Ref RawRetentionDays
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access/raw/
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-to-glacier-ir
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt RawBucket.Arn, !Sub "${RawBucket.Arn}/*"]
+            Condition:
+              Bool: {aws:SecureTransport: "false"}
+
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub retailbank-lake-${Env}-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access/lake/
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-lake-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+
+  LakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LakeBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt LakeBucket.Arn, !Sub "${LakeBucket.Arn}/*"]
+            Condition:
+              Bool: {aws:SecureTransport: "false"}
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub retailbank-artifacts-${Env}-${AWS::AccountId}
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt ArtifactsBucket.Arn, !Sub "${ArtifactsBucket.Arn}/*"]
+            Condition:
+              Bool: {aws:SecureTransport: "false"}
+
+  BatchControlTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub retailbank-${Env}-batch-control
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: batch_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: batch_id, KeyType: HASH}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+
+  # ------------------------------------------------------------ alerting
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub retailbank-${Env}-alerts
+      KmsMasterKeyId: !Ref DataKey
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventsAndAlarms
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com, cloudwatch.amazonaws.com]
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------ event path
+  RawBatchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub retailbank-${Env}-raw-batch-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref DataKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  RawBatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub retailbank-${Env}-raw-batch-events
+      VisibilityTimeout: 300
+      KmsMasterKeyId: !Ref DataKey
+      KmsDataKeyReusePeriodSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RawBatchDLQ.Arn
+        maxReceiveCount: 5
+
+  ManifestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: manifest.json landed in the raw bucket
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref RawBucket]
+          object:
+            key: [{suffix: manifest.json}]
+      Targets:
+        - Id: raw-batch-queue
+          Arn: !GetAtt RawBatchQueue.Arn
+
+  RawBatchQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref RawBatchQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt RawBatchQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ManifestRule.Arn
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages in the raw batch dead-letter queue (a batch was rejected 5 times)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt RawBatchDLQ.QueueName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------ registrar (Lambda)
+  RegistrarLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/retailbank-${Env}-registrar
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt DataKey.Arn
+
+  RegistrarRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      Policies:
+        - PolicyName: registrar
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub ${RawBucket.Arn}/*
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !GetAtt DataKey.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem]
+                Resource: !GetAtt BatchControlTable.Arn
+              - Effect: Allow
+                Action: [states:StartExecution]
+                Resource: !Ref BatchStateMachine
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${RegistrarLogGroup.Arn}:*
+
+  RegistrarFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RegistrarLogGroup
+    Properties:
+      FunctionName: !Sub retailbank-${Env}-registrar
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt RegistrarRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          CONTROL_TABLE: !Ref BatchControlTable
+          STATE_MACHINE_ARN: !Ref BatchStateMachine
+      Code:
+        ZipFile: |
+          import hashlib, json, os
+          import boto3
+
+          s3 = boto3.client("s3")
+          ddb = boto3.client("dynamodb")
+          sfn = boto3.client("stepfunctions")
+
+
+          def handler(event, _):
+              for rec in event["Records"]:
+                  detail = json.loads(rec["body"])["detail"]
+                  bucket, key = detail["bucket"]["name"], detail["object"]["key"]
+                  manifest = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+                  folder = key.rsplit("/", 1)[0]
+                  # Verify every landed file against the checksum in the manifest before any processing.
+                  for f in manifest["files"]:
+                      body = s3.get_object(Bucket=bucket, Key=f"{folder}/{f['key']}")["Body"].read()
+                      if hashlib.sha256(body).hexdigest() != f["sha256"]:
+                          raise ValueError(f"checksum mismatch: {f['key']}")
+                  bid = manifest["batch_id"]
+                  try:
+                      # Idempotency lock: a duplicate event for the same batch is skipped.
+                      ddb.put_item(
+                          TableName=os.environ["CONTROL_TABLE"],
+                          Item={"batch_id": {"S": bid}, "status": {"S": "RECEIVED"},
+                                "load_type": {"S": manifest["load_type"]}, "manifest_key": {"S": key}},
+                          ConditionExpression="attribute_not_exists(batch_id)",
+                      )
+                  except ddb.exceptions.ConditionalCheckFailedException:
+                      print(f"duplicate event for {bid}, skipped")
+                      continue
+                  # Execution names stay reserved after a run, so each upload gets its own name.
+                  version = "".join(c for c in detail["object"].get("version-id", "v0") if c.isalnum())[:32]
+                  sfn.start_execution(
+                      stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+                      name=f"{bid}-{version}",
+                      input=json.dumps({"batch_id": bid, "manifest_key": key}),
+                  )
+                  print(f"started {bid}")
+
+  RegistrarEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RawBatchQueue.Arn
+      FunctionName: !Ref RegistrarFunction
+      BatchSize: 1
+
+  RegistrarErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Registrar Lambda failed (checksum mismatch or AWS error)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref RegistrarFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------ batch job (Glue Python shell)
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: batch-data
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawBucket.Arn
+                  - !Sub ${RawBucket.Arn}/*
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:DeleteObject]
+                Resource:
+                  - !GetAtt LakeBucket.Arn
+                  - !Sub ${LakeBucket.Arn}/*
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt DataKey.Arn
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+                Resource: !GetAtt BatchControlTable.Arn
+
+  BatchGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub retailbank-${Env}-batch
+      Role: !Ref GlueRole
+      GlueVersion: "3.0"
+      MaxCapacity: 1.0
+      MaxRetries: 0
+      Timeout: 60
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub s3://${ArtifactsBucket}/glue/pipeline_runner.py
+      DefaultArguments:
+        "--additional-python-modules": "pandas==2.2.3,pyarrow==19.0.0,duckdb==1.1.3"
+        "--RAW_BUCKET": !Ref RawBucket
+        "--LAKE_BUCKET": !Ref LakeBucket
+        "--CONTROL_TABLE": !Ref BatchControlTable
+        "--ARTIFACTS_BUCKET": !Ref ArtifactsBucket
+
+  GlueFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Batch Glue job failed, timed out, or errored
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref BatchGlueJob]
+          state: [FAILED, TIMEOUT, ERROR]
+      Targets:
+        - Id: alert
+          Arn: !Ref AlertTopic
+
+  # ------------------------------------------------------------ orchestration (Step Functions)
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/retailbank-${Env}-batch
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt DataKey.Arn
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: run-glue
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${BatchGlueJob}
+              - Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForGlueJobRunRule
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: "*"
+
+  BatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub retailbank-${Env}-batch
+      RoleArn: !GetAtt StateMachineRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "RunBatchGlueJob",
+          "States": {
+            "RunBatchGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${BatchGlueJob}",
+                "Arguments": {
+                  "--BATCH_ID.$": "$.batch_id",
+                  "--MANIFEST_KEY.$": "$.manifest_key"
+                }
+              },
+              "Retry": [{
+                "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 20,
+                "BackoffRate": 1.0
+              }],
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "BatchFailed"}],
+              "End": true
+            },
+            "BatchFailed": {
+              "Type": "Fail",
+              "Error": "BatchFailed",
+              "Cause": "Glue batch job failed. See the batch_control table for the error."
+            }
+          }
+        }
+
+  ExecutionFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Batch Step Functions execution failed, timed out, or aborted
+      EventPattern:
+        source: [aws.states]
+        detail-type: [Step Functions Execution Status Change]
+        detail:
+          status: [FAILED, TIMED_OUT, ABORTED]
+          stateMachineArn: [!Ref BatchStateMachine]
+      Targets:
+        - Id: alert
+          Arn: !Ref AlertTopic
+
+  # ------------------------------------------------------------ catalog (tables are owned by this stack)
+  CatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub retailbank_${Env}
+        Description: RetailBank lake tables (gold, silver, quarantine, control, serving)
+
+  GoldFactTransactionTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: fact_transaction
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/gold/fact_transaction/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: transaction_id, Type: string}
+            - {Name: account_id, Type: string}
+            - {Name: product_id, Type: string}
+            - {Name: branch_id, Type: string}
+            - {Name: transaction_date, Type: timestamp}
+            - {Name: timestamp, Type: timestamp}
+            - {Name: amount, Type: bigint}
+            - {Name: payment_method, Type: string}
+            - {Name: status, Type: string}
+            - {Name: currency, Type: string}
+            - {Name: remarks, Type: string}
+            - {Name: is_refund, Type: boolean}
+            - {Name: is_correction, Type: boolean}
+            - {Name: dq_flags, Type: string}
+            - {Name: customer_sk, Type: bigint}
+            - {Name: product_sk, Type: bigint}
+            - {Name: branch_sk, Type: bigint}
+            - {Name: loaded_batch_id, Type: string}
+            - {Name: first_batch_id, Type: string}
+
+  GoldDimCustomerTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: dim_customer
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/gold/dim_customer/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: customer_id, Type: string}
+            - {Name: customer_name, Type: string}
+            - {Name: email, Type: string}
+            - {Name: phone, Type: string}
+            - {Name: account_id, Type: string}
+            - {Name: gender, Type: string}
+            - {Name: dob, Type: timestamp}
+            - {Name: address, Type: string}
+            - {Name: kyc_status, Type: string}
+            - {Name: registration_date, Type: timestamp}
+            - {Name: dq_flags, Type: string}
+            - {Name: row_hash, Type: string}
+            - {Name: customer_sk, Type: bigint}
+            - {Name: valid_from, Type: timestamp}
+            - {Name: valid_to, Type: timestamp}
+            - {Name: is_current, Type: boolean}
+
+  GoldDimBranchTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: dim_branch
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/gold/dim_branch/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: branch_id, Type: string}
+            - {Name: branch_name, Type: string}
+            - {Name: location, Type: string}
+            - {Name: manager_name, Type: string}
+            - {Name: opened_date, Type: timestamp}
+            - {Name: region, Type: string}
+            - {Name: branch_type, Type: string}
+            - {Name: contact_number, Type: string}
+            - {Name: dq_flags, Type: string}
+            - {Name: row_hash, Type: string}
+            - {Name: branch_sk, Type: bigint}
+            - {Name: valid_from, Type: timestamp}
+            - {Name: valid_to, Type: timestamp}
+            - {Name: is_current, Type: boolean}
+
+  GoldDimProductTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: dim_product
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/gold/dim_product/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: product_id, Type: string}
+            - {Name: product_name, Type: string}
+            - {Name: product_type, Type: string}
+            - {Name: price, Type: bigint}
+            - {Name: launch_date, Type: timestamp}
+            - {Name: is_active, Type: boolean}
+            - {Name: category, Type: string}
+            - {Name: vendor_name, Type: string}
+            - {Name: dq_flags, Type: string}
+            - {Name: row_hash, Type: string}
+            - {Name: product_sk, Type: bigint}
+            - {Name: valid_from, Type: timestamp}
+            - {Name: valid_to, Type: timestamp}
+            - {Name: is_current, Type: boolean}
+
+  ControlDqScorecardTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: dq_scorecard
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/control/dq_scorecard/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: batch_id, Type: string}
+            - {Name: source_file, Type: string}
+            - {Name: entity, Type: string}
+            - {Name: received, Type: bigint}
+            - {Name: passed, Type: bigint}
+            - {Name: rejected, Type: bigint}
+            - {Name: top_reasons, Type: string}
+
+  ServingBatchChangesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: batch_changes
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/serving/batch_changes/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: batch_id, Type: string}
+            - {Name: fact_inserted, Type: bigint}
+            - {Name: fact_updated, Type: bigint}
+            - {Name: fact_corrected, Type: bigint}
+            - {Name: customers_new, Type: bigint}
+            - {Name: customers_changed, Type: bigint}
+            - {Name: products_changed, Type: bigint}
+            - {Name: branches_changed, Type: bigint}
+
+  ServingKpiSnapshotTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: kpi_snapshot
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/serving/kpi_snapshot/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: batch_id, Type: string}
+            - {Name: kpi, Type: string}
+            - {Name: key, Type: string}
+            - {Name: metric, Type: double}
+
+  SilverTransactionsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: silver_transactions
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/silver/transactions/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: transaction_id, Type: string}
+            - {Name: account_id, Type: string}
+            - {Name: product_id, Type: string}
+            - {Name: branch_id, Type: string}
+            - {Name: transaction_date, Type: timestamp}
+            - {Name: timestamp, Type: timestamp}
+            - {Name: amount, Type: bigint}
+            - {Name: payment_method, Type: string}
+            - {Name: status, Type: string}
+            - {Name: currency, Type: string}
+            - {Name: remarks, Type: string}
+            - {Name: is_refund, Type: boolean}
+            - {Name: is_correction, Type: boolean}
+            - {Name: dq_flags, Type: string}
+            - {Name: customer_sk, Type: bigint}
+            - {Name: product_sk, Type: bigint}
+            - {Name: branch_sk, Type: bigint}
+
+  SilverCustomersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: silver_customers
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/silver/customers/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: customer_id, Type: string}
+            - {Name: customer_name, Type: string}
+            - {Name: email, Type: string}
+            - {Name: phone, Type: string}
+            - {Name: account_id, Type: string}
+            - {Name: gender, Type: string}
+            - {Name: dob, Type: timestamp}
+            - {Name: address, Type: string}
+            - {Name: kyc_status, Type: string}
+            - {Name: registration_date, Type: timestamp}
+            - {Name: dq_flags, Type: string}
+
+  SilverBranchesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: silver_branches
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/silver/branches/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: branch_id, Type: string}
+            - {Name: branch_name, Type: string}
+            - {Name: location, Type: string}
+            - {Name: manager_name, Type: string}
+            - {Name: opened_date, Type: timestamp}
+            - {Name: region, Type: string}
+            - {Name: branch_type, Type: string}
+            - {Name: contact_number, Type: string}
+            - {Name: dq_flags, Type: string}
+
+  SilverProductsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: silver_products
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/silver/products/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: product_id, Type: string}
+            - {Name: product_name, Type: string}
+            - {Name: product_type, Type: string}
+            - {Name: price, Type: bigint}
+            - {Name: launch_date, Type: timestamp}
+            - {Name: is_active, Type: boolean}
+            - {Name: category, Type: string}
+            - {Name: vendor_name, Type: string}
+            - {Name: dq_flags, Type: string}
+
+  QuarantineTransactionsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: quarantine_transactions
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/quarantine/transactions/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: entity, Type: string}
+            - {Name: batch_id, Type: string}
+            - {Name: source_file, Type: string}
+            - {Name: source_row, Type: int}
+            - {Name: rule_id, Type: string}
+            - {Name: error_code, Type: string}
+            - {Name: error_detail, Type: string}
+            - {Name: raw_payload, Type: string}
+
+  QuarantineCustomersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: quarantine_customers
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/quarantine/customers/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: entity, Type: string}
+            - {Name: batch_id, Type: string}
+            - {Name: source_file, Type: string}
+            - {Name: source_row, Type: int}
+            - {Name: rule_id, Type: string}
+            - {Name: error_code, Type: string}
+            - {Name: error_detail, Type: string}
+            - {Name: raw_payload, Type: string}
+
+  QuarantineBranchesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: quarantine_branches
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/quarantine/branches/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: entity, Type: string}
+            - {Name: batch_id, Type: string}
+            - {Name: source_file, Type: string}
+            - {Name: source_row, Type: int}
+            - {Name: rule_id, Type: string}
+            - {Name: error_code, Type: string}
+            - {Name: error_detail, Type: string}
+            - {Name: raw_payload, Type: string}
+
+  QuarantineProductsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CatalogDatabase
+      TableInput:
+        Name: quarantine_products
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/quarantine/products/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: entity, Type: string}
+            - {Name: batch_id, Type: string}
+            - {Name: source_file, Type: string}
+            - {Name: source_row, Type: int}
+            - {Name: rule_id, Type: string}
+            - {Name: error_code, Type: string}
+            - {Name: error_detail, Type: string}
+            - {Name: raw_payload, Type: string}
+
+  # ------------------------------------------------------------ serving (Athena)
+  AthenaResultsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/athena/retailbank-${Env}
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt DataKey.Arn
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub retailbank-${Env}
+      Description: RetailBank production query workgroup
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${LakeBucket}/athena-results/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt DataKey.Arn
+
+Outputs:
+  RawBucket:
+    Value: !Ref RawBucket
+  LakeBucket:
+    Value: !Ref LakeBucket
+  ArtifactsBucket:
+    Value: !Ref ArtifactsBucket
+  BatchControlTable:
+    Value: !Ref BatchControlTable
+  BatchStateMachineArn:
+    Value: !Ref BatchStateMachine
+  BatchGlueJob:
+    Value: !Ref BatchGlueJob
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+  CatalogDatabase:
+    Value: !Ref CatalogDatabase
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DataKeyArn:
+    Value: !GetAtt DataKey.Arn

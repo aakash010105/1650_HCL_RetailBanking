@@ -1,0 +1,10 @@
+customer_id,customer_name,from_status,to_status,changed_on
+C007,Customer_7,Pending,Verified,2026-10-02
+C018,Customer_18,Pending,Verified,2026-10-02
+C037,Customer_37,Pending,Verified,2026-10-02
+C064,Customer_64,Pending,Verified,2026-10-02
+C109,Customer_109,Pending,Verified,2026-10-02
+C117,Customer_117,Pending,Verified,2026-10-02
+C132,Customer_132,Pending,Verified,2026-10-02
+C141,Customer_141,Pending,Verified,2026-10-02
+C147,Customer_147,Pending,Verified,2026-10-02
