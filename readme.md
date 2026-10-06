@@ -1,21 +1,17 @@
 # RetailBank Customer Transaction Analytics Platform
-## System Design, Architecture Specification & Evaluation Defense Guide
+
+A batch analytics platform on AWS for RetailBank's branches, customers, products, and transactions.
+It loads a Day 1 baseline and a Day 2 incremental drop, cleanses and validates both, keeps history
+(SCD Type 2 for dimensions), and serves 13 KPIs.
+
+- Region: `ap-southeast-2`
+- Runbook (commands, deployment steps, known issues): [docs/runbook.md](docs/runbook.md)
+- Design rationale and review Q&A: [docs/design_defense.md](docs/design_defense.md)
+- Full target design: [banking_retail_system_design.md](banking_retail_system_design.md)
 
 ---
 
-## 1. High-Level Architectural Philosophy
-
-Financial and core banking data pipelines cannot tolerate standard big-data failure modes. They face three fatal pitfalls:
-1. **Partial / Race-Condition Loads:** Ingesting `transactions.csv` before `customers.csv` finishes uploading causes valid transactions to fail referential integrity and foreign-key checks.
-2. **Silent Data Corruption & Non-Idempotent Retries:** Dropping bad rows silently to "keep the job green", or re-running a failed batch and accidentally double-counting revenue and balances.
-3. **Lost History & Non-Auditability:** Overwriting a customer’s `Pending` KYC status with `Verified` in-place destroys historical truth, making it impossible for compliance auditors to reconstruct what the customer's status was at the exact moment a suspicious transaction occurred.
-
-This architecture resolves all three challenges through **four foundational engineering tenets**:
-
-* **Manifest-Driven Eventing:** Downstream compute is never triggered on individual raw file arrivals; it triggers strictly upon atomic arrival of `manifest.json`.
-* **Medallion Architecture (Bronze $\rightarrow$ Silver $\rightarrow$ Gold + Quarantine):** Immutable raw storage, zero silent data loss, and dedicated quarantine handling for human stewardship.
-* **Two-Stage Dependency DAG:** Dimension datasets (Stage 1) must be cleansed, validated, and merged into Gold before Fact datasets (Stage 2) execute referential integrity lookups.
-* **Lakehouse ACID (`Apache Iceberg`) + High-Concurrency Warehouse (`Redshift Serverless`):** Row-level `MERGE INTO`, snapshot time travel, and **SCD Type 2** tracking on cost-effective S3 storage, backed by sub-second pre-computed **Materialized Views** in Redshift for analytics.
+## 1. High-Level Architecture
 
 ```mermaid
 flowchart TD
@@ -63,278 +59,200 @@ flowchart TD
     end
 ```
 
----
+### What is built today
 
-## 2. Layer-by-Layer Technical Specification
+Some parts of the diagram above are planned rather than built. This table shows the difference.
 
-### Layer 1: Ingestion & S3 Bronze Zone (Raw Layer)
-
-| Component | Technology | Primary Function |
-| :--- | :--- | :--- |
-| **Source Producers** | AWS DMS / Batch Dump Service | Extracts full tables (Day 1) and continuous CDC logs (Day 2+). |
-| **Raw Storage** | Amazon S3 Bronze (`bank-dl-raw-<env>`) | Immutable storage partitioned by entity, load type, and batch. |
-| **Security & Compliance** | S3 Object Lock + KMS CMK | WORM (Write-Once-Read-Many) compliance (SEC 17a-4 / FINRA). |
-| **Completion Marker** | `manifest.json` | Signals downstream workers that all files in the batch are flushed. |
-
-#### Internal Execution Flow:
-1. **Partition Structure**: Raw files are written to deterministic Hive paths:
-   ```text
-   s3://bank-dl-raw/raw/entity=<entity>/load_type=<baseline|incremental>/dt=YYYY-MM-DD/batch_id=<id>/
-   ```
-2. **Atomic Manifest Emission**: Data files (`customers.csv`, `transactions.csv`, `products.json`, `branches.csv`) land first. The producer flushes `manifest.json` **last**. The manifest includes:
-   ```json
-   {
-     "batch_id": "BATCH_20261006_01",
-     "load_type": "INCREMENTAL",
-     "cutoff_ts": "2026-10-06T09:00:00Z",
-     "files": [
-       {
-         "s3_uri": "s3://bank-dl-raw/raw/entity=customers/.../data.csv",
-         "row_count": 15000,
-         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-       }
-     ]
-   }
-   ```
-
-#### Design Rationale:
-* **Why `manifest.json` instead of triggering on raw file creation?**
-  Writing large datasets produces split part-files (`part-0000.csv`, `part-0001.csv`). Triggering on file uploads would fire tens of premature, concurrent pipeline executions. Triggering on `manifest.json` guarantees 100% batch presence before compute begins.
-* **Why S3 Object Lock in Compliance Mode?**
-  Guarantees that raw data cannot be overwritten or deleted even by the AWS root account during the mandatory retention window, fulfilling banking regulatory standards and enabling zero-loss reprocessing.
+| Area | Diagram | Built | Status |
+|---|---|---|---|
+| Ingestion | DMS full load and CDC | Batch files landed by `deploy/deploy.py` with `manifest.json` written last | Partial (DMS planned) |
+| Trigger | EventBridge, SQS main queue, DLQ after 5 receives | Same | Built |
+| Registrar | SHA-256 and row-count verification, DynamoDB conditional put, named execution | SHA-256 verified; conditional put; execution named batch + S3 version id | Built (row counts not yet verified) |
+| Orchestration | Map over dimensions, then facts | Step Functions runs one Glue job that does both stages in order | Simplified |
+| Processing | Glue PySpark | Glue Python shell (pandas + DuckDB), same code runs locally | Simplified |
+| Silver / Quarantine | S3 Parquet, quarantine with `error_code` and raw payload | Same | Built |
+| Gold | Iceberg tables with MERGE | Parquet folders; merge logic in Python, full rewrite per batch | Simplified |
+| Reconcile | Lambda with four invariants | Row-count check and reject threshold inside the Glue job | Partial |
+| Serving | Redshift Serverless, materialized views, QuickSight | Athena views over Gold; dashboard generated from Athena | Simplified (QuickSight blocked by an SCP) |
+| Alerts | SNS on failure | SNS topic; rules for Glue failures, Step Functions failures, DLQ, Lambda errors | Built |
 
 ---
 
-### Layer 2: Control Plane, Buffering & Distributed Idempotency
+## 2. Layer-by-Layer Specification
 
-| Component | Technology | Primary Function |
-| :--- | :--- | :--- |
-| **Event Routing** | Amazon EventBridge | Filters for `ObjectCreated` events matching `raw/**/manifest.json`. |
-| **Shock Absorber** | Amazon SQS (`raw-batch-events`) | Decouples ingestion bursts from compute and absorbs traffic spikes. |
-| **Poison-Pill Protection** | Amazon SQS DLQ (`raw-batch-events-dlq`) | Isolates malformed batch manifests after 5 failed retries. |
-| **Gatekeeper Function** | AWS Lambda (`Registrar`) | Validates cryptographic hashes, row counts, and issues distributed locks. |
-| **Idempotency Store** | Amazon DynamoDB (`batch_control`) | Atomic state tracking preventing duplicate pipeline invocations. |
+### Layer 1: Ingestion and Bronze (raw)
 
-#### Internal Execution Flow:
-1. EventBridge evaluates the object creation prefix and forwards the event to the SQS Main Queue.
-2. Registrar Lambda consumes the message:
-   * Re-computes SHA-256 hashes of all files in S3 and validates them against the manifest.
-   * Compares physical line counts against declared row counts.
-   * Executes a conditional write to DynamoDB:
-     ```python
-     dynamodb.put_item(
-         TableName="batch_control",
-         Item={"batch_id": {"S": batch_id}, "status": {"S": "RECEIVED"}, "created_at": {"S": now}},
-         ConditionExpression="attribute_not_exists(batch_id)"
-     )
-     ```
-   * Starts Step Functions execution with `name=batch_id`.
+- **Bucket:** `retailbank-raw-<env>-<account>`, versioned, with Object Lock in prod (`GOVERNANCE`, 7-year default; `COMPLIANCE` is an option once compliance confirms).
+- **Layout:** `raw/load_type=<baseline|incremental>/dt=<YYYY-MM-DD>/batch_id=<id>/<file>`
+- **Completion marker:** `manifest.json` is written last. It is the only event that starts processing.
 
-#### Design Rationale:
-* **Why SQS before Lambda?**
-  At midnight or end-of-month, dozens of branches flush batches simultaneously. Direct EventBridge-to-Lambda invocation risks hitting concurrency limits. SQS acts as a buffer and provides DLQ visibility.
-* **Why DynamoDB conditional write + Named Step Function?**
-  SQS provides *at-least-once* delivery. If a message is delivered twice, the second Registrar Lambda invocation fails the conditional write, and the Step Functions call is rejected by AWS as an execution name collision.
-
----
-
-### Layer 3: Step Functions Orchestration DAG
-
-The entire lifecycle is coordinated by a state machine utilizing AWS SDK integrations (`.sync`):
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SF as Step Functions
-    participant DDB as DynamoDB (batch_control)
-    participant G1 as Glue Stage 1 (Dims Parallel)
-    participant G2 as Glue Stage 2 (Facts Sequential)
-    participant RS as Redshift Serverless
-    participant REC as Reconcile Lambda
-    participant SNS as Amazon SNS
-
-    SF->>DDB: Conditional Lock: status = RUNNING
-    SF->>G1: Execute Stage 1 (Branches, Customers, Products in parallel)
-    G1-->>SF: Stage 1 Completed Successfully
-    SF->>G2: Execute Stage 2 (Transactions Clean + Curate with Ref Check)
-    G2-->>SF: Stage 2 Completed Successfully
-    SF->>RS: Redshift Data API (COPY + MERGE + REFRESH MVs)
-    RS-->>SF: Serving Load Successful
-    SF->>REC: Run Parity & Control Total Verification
-    alt All Checks Pass
-        REC-->>SF: Parity Verified (100%)
-        SF->>DDB: Update Status = LOADED
-    else Failure at Any Step
-        SF->>DDB: Update Status = FAILED
-        SF->>SNS: Publish PagerDuty / Ops Alert
-    end
+```json
+{
+  "batch_id": "day2-incremental",
+  "load_type": "incremental",
+  "dt": "2026-10-02",
+  "cutoff_ts": "2026-10-02T00:00:00",
+  "schema_version": "1.0",
+  "files": [
+    {"entity": "customers", "key": "customer_updates_2.csv",
+     "sha256": "…", "bytes": 6225, "row_count": 47}
+  ]
+}
 ```
 
-#### State Definitions:
-1. **`ValidateBatch`**: Parses `load_type` (`BASELINE` vs. `INCREMENTAL`).
-2. **`Stage1_Dimensions` (Map State, MaxConcurrency = 3)**:
-   * Branches: `CleanValidate` $\rightarrow$ `CurateDimension` (Iceberg MERGE).
-   * Products: `CleanValidate` $\rightarrow$ `CurateDimension` (Iceberg MERGE).
-   * Customers: `CleanValidate` $\rightarrow$ `CurateDimension` (Iceberg SCD Type 2).
-3. **`Stage2_Facts` (Sequential)**: Executes **only after all Stage 1 dimensions succeed**.
-   * `CleanValidate` (verifies foreign keys against updated Gold dimensions).
-   * `CurateFact` (Iceberg MERGE for transactions & reversals).
-4. **`RedshiftLoad`**: Dispatches transactional SQL via the Redshift Data API.
-5. **`Reconcile`**: Audits mathematical row and currency conservation.
-6. **`MarkLoaded` / Catch Block**: Sets final batch state or alerts operations via SNS.
+**Why `manifest.json` triggers the pipeline:** the producer writes several files for one batch. Triggering on each file would start several runs while the batch is still uploading. Triggering on the manifest waits until every file is there.
 
----
+### Layer 2: Control plane and idempotency
 
-### Layer 4: Processing & Data Quality Engine (Silver & Quarantine)
+1. EventBridge matches `ObjectCreated` events for `manifest.json` in the raw bucket and sends them to the SQS queue.
+2. Messages that fail five times go to the DLQ, and an alarm fires.
+3. The registrar Lambda reads the manifest, checks each file's SHA-256 against the manifest, and writes `batch_id` to DynamoDB with `attribute_not_exists(batch_id)`. A duplicate delivery fails that write and is skipped.
+4. It starts the Step Functions execution. Execution names stay reserved after a run, so the name is `batch_id` plus the S3 version id, which is unique per upload.
 
-Implemented via **AWS Glue 4.0 (PySpark on G.1X workers)** using externalized YAML data quality configurations.
-
-#### Cleansing & Transformation Rules:
-* **Products (`products.json`)**:
-  * Employs a resilient parser that handles concatenated or malformed JSON payloads.
-  * Normalizes boolean flags (`"true"`, `1`, `"yes"` $\rightarrow$ `True`).
-  * Enforces positive pricing (`price > 0.00`).
-* **Customers (`customers.csv`)**:
-  * Unifies multi-format dates (`YYYY-MM-DD`, `DD/MM/YYYY`, `MM-DD-YYYY`).
-  * Normalizes KYC status values (`VERIFIED`, `v`, `Verified` $\rightarrow$ `Verified`).
-  * Quarantines future dates of birth (`dob > CURRENT_DATE`) and invalid email formats.
-  * Resolves account conflicts where two customer entities share a duplicate `account_id`.
-* **Transactions (`transactions.csv`)**:
-  * Strips currency symbols (`"₹"`, `","`) and casts amounts to `DECIMAL(18,2)`.
-  * Resolves timestamp vs. date discrepancies.
-  * Quarantines zero or negative amounts (`amount <= 0`).
-  * **Referential Integrity Check**: Performs broadcast joins against Gold `dim_customer`, `dim_product`, and `dim_branch`. If any foreign key is missing, the transaction is routed to Quarantine with `error_code = 'MISSING_DIM'`.
-
-#### Output Routing:
-* **Valid Rows** $\rightarrow$ `s3://bank-dl-cleansed/<entity>/batch_id=<id>/` (Snappy-compressed Parquet).
-* **Invalid Rows** $\rightarrow$ `s3://bank-dl-quarantine/<entity>/batch_id=<id>/` (Appended with metadata columns: `error_code`, `error_detail`, `rule_id`, `raw_payload`).
-* **Data Steward Interface**: Quarantined records are queryable through **Amazon Athena** views (`quarantine.v_<entity>`), allowing operational inspection without polluting production warehouses.
-
----
-
-### Layer 5: Curated Lakehouse Layer (S3 Gold + Apache Iceberg)
-
-Registered in the **AWS Glue Data Catalog**, the Gold layer utilizes **Apache Iceberg** table format.
-
-#### Dimension Management: Slowly Changing Dimensions (SCD Type 2)
-For entities requiring historical auditability (specifically `dim_customer` tracking `kyc_status`, `risk_tier`, and address):
-* A deterministic hash is calculated:
-  $$\text{row\_hash} = \text{SHA256}(\text{kyc\_status} \parallel \text{address} \parallel \text{risk\_tier})$$
-* When an incoming record contains an existing `account_id` but a modified `row_hash`:
-  1. The active record in Gold is expired:
-     $$\text{valid\_to} = \text{cutoff\_ts}, \quad \text{is\_current} = \text{false}$$
-  2. A new record is inserted:
-     $$\text{customer\_sk} = \text{UUID}(), \quad \text{valid\_from} = \text{cutoff\_ts}, \quad \text{valid\_to} = \text{'9999-12-31'}, \quad \text{is\_current} = \text{true}$$
-* If the `row_hash` matches the active record, the update is skipped, guaranteeing idempotent re-execution.
-
-#### Fact Management: ACID `MERGE INTO`
-Transactions are merged using Iceberg's row-level mutation engine:
-```sql
-MERGE INTO gold.fact_transaction target
-USING silver_transactions source
-ON target.transaction_id = source.transaction_id
-WHEN MATCHED AND source.is_reversal = true THEN
-  UPDATE SET target.status = 'REVERSED', target.updated_at = source.commit_ts
-WHEN MATCHED THEN
-  UPDATE SET target.amount = source.amount, target.status = source.status, target.updated_at = source.commit_ts
-WHEN NOT MATCHED THEN
-  INSERT (transaction_id, account_id, branch_id, product_id, amount, status, transaction_timestamp)
-  VALUES (source.transaction_id, source.account_id, source.branch_id, source.product_id, source.amount, source.status, source.transaction_timestamp);
-```
-
-#### Why Apache Iceberg Over Plain Parquet:
-* **Row-Level Mutations**: Plain Parquet requires rewriting entire partitions to update a single transaction reversal.
-* **ACID Guarantees**: Readers never see uncommitted or partial batch writes.
-* **Snapshot Time Travel**: Enables querying the lakehouse at historical points in time:
-  ```sql
-  SELECT * FROM gold.fact_transaction FOR SYSTEM_TIME AS OF '2026-10-01 00:00:00';
-  ```
-
----
-
-### Layer 6: Serving, Reconciliation & Business Intelligence
-
-| Component | Technology | Primary Function |
-| :--- | :--- | :--- |
-| **Serving Warehouse** | Amazon Redshift Serverless | High-concurrency analytical engine running over `staging`, `dw`, and `kpi` schemas. |
-| **Data API** | Amazon Redshift Data API | Asynchronous, connectionless SQL execution managed by Step Functions. |
-| **Pre-Calculated Views** | Materialized Views (`mv_kpi_01..13`) | Sub-second aggregation for compute-intensive analytical queries. |
-| **Automated Auditor** | Reconcile Lambda + DynamoDB | Evaluates row conservation and currency totals before publishing. |
-| **Visual Analytics** | Amazon QuickSight | Enterprise dashboards with Row-Level Security (RLS) enforcement. |
-
-#### Automated Reconciliation Mathematical Invariants:
-The Reconcile Lambda enforces four strict invariants prior to marking a batch successful:
-
-$$\text{1. Conservation of Rows: } N_{\text{manifest}} = N_{\text{silver\_valid}} + N_{\text{quarantine}}$$
-
-$$\text{2. Financial Control Total: } \sum \text{Amount}_{\text{silver\_valid}} = \sum \text{Amount}_{\text{gold\_merged}}$$
-
-$$\text{3. Key Coverage: } \text{Keys}(\text{Silver}) \subseteq \text{Keys}(\text{Gold})$$
-
-$$\text{4. Warehouse Parity: } \text{Count}(\text{Gold Iceberg}) = \text{Count}(\text{Redshift } dw.\text{fact\_transaction})$$
-
-Results are written to `DynamoDB batch_audit`. If any condition fails, the Redshift staging transaction is rolled back, and an alert is dispatched via SNS.
-
----
-
-### Layer 7: Security, Compliance & Observability Matrix
+### Layer 3: Orchestration
 
 ```
-                        ┌──────────────────────────────────────────────┐
-                        │              AWS Lake Formation              │
-                        │    (Central Column/Row-Level Permissions)    │
-                        └──────────────────────┬───────────────────────┘
-                                               │
-             ┌─────────────────────────────────┼─────────────────────────────────┐
-             ▼                                 ▼                                 ▼
-┌─────────────────────────┐       ┌─────────────────────────┐       ┌─────────────────────────┐
-│     AWS KMS (CMK)       │       │      Amazon Macie       │       │  VPC PrivateLink (No    │
-│ Envelope Encryption at  │       │ Automated PII & Leak    │       │ Public Internet Transit)│
-│ Rest (S3, DDB, SQS, RS) │       │ Detection in S3 Bronze  │       │ Lambda, Glue, S3, RS    │
-└─────────────────────────┘       └─────────────────────────┘       └─────────────────────────┘
+RunBatchGlueJob  (glue:startJobRun.sync)
+  Retry: Glue.ConcurrentRunsExceededException, 20 attempts, 60 s apart
+  Catch: any other error -> BatchFailed
 ```
 
-* **Lake Formation**: Centralizes column-level masking over the Glue Catalog. PII fields (`phone`, `email`, `dob`) are masked for reporting analysts while remaining unmasked for authorized compliance roles (`pii_reader`).
-* **Amazon Macie**: Continuously inspects S3 Bronze Raw to catch unmasked credit card numbers or national IDs accidentally included by upstream source feeds.
-* **VPC Endpoints (PrivateLink)**: Ensures all communication between Lambda, Glue, S3, DynamoDB, and Redshift stays strictly inside the AWS private network backbone.
+- The Glue job allows one run at a time. Two batches writing the same Gold tables at once would corrupt them, so the retry waits for the running batch to finish.
+- Each batch runs Stage 1 (branches, products, customers) and then Stage 2 (transactions) in one job. A batch never reaches Stage 2 without Stage 1 finishing.
+- A failed batch leaves Gold in its pre-batch state. The job restores the snapshot it took at the start.
+
+### Layer 4: Cleansing and data quality
+
+Stage 1 (dimensions):
+
+| Entity | Rules |
+|---|---|
+| Customers | Exact and near duplicates on `customer_id` (kept: fewest flags); conflicting duplicates quarantined; email case and `@@` fixed, invalid emails nulled; phones normalized to `+91-XXXXXXXXXX`; KYC status normalized; DOB in the future, under 18, or over 110 quarantined; two customers on one account: the one whose ID matches the account is kept, the other quarantined; registration dates in several formats, day-first assumed when ambiguous |
+| Branches | Duplicates by `branch_id`; region and branch type normalized; missing manager set to `UNASSIGNED`; `(New)` label stripped; invalid phone nulled |
+| Products | `products_json.txt` repaired when an object is missing its comma (recorded in the batch audit); duplicate `product_id` with different prices quarantined; negative prices quarantined, not auto-corrected; `is_active` normalized, missing defaults to false |
+
+Stage 2 (transactions):
+
+| Rule | Behaviour |
+|---|---|
+| Amount | `₹`, commas, and `Rs.` stripped; blank, zero, and negative amounts quarantined |
+| Date and timestamp | Timestamp is the authority; a disagreeing date is reconciled to it and flagged; a future date column or timestamp is quarantined |
+| Status and payment method | Typos normalized (`Succes` → `SUCCESS`); unknown values quarantined |
+| Refund flag | `Y`, `1`, `True` → true; `N`, `0`, `False` → false; blank defaults to false and is flagged |
+| Duplicates | Exact copies dropped (logged); different values on the same ID: all copies quarantined |
+| Late corrections | Rows marked `[late correction]` update the existing fact row in place |
+| Referential integrity | Account, product, and branch must exist in the Gold dimensions; otherwise quarantined as `MISSING_DIM` |
+
+Every rejected row is kept in the quarantine with its rule ID, error code, and raw payload. Repaired rows load with a flag in `dq_flags`.
+
+Current results (both batches): 1,679 rows received, 1,291 passed, 388 quarantined. Details in
+`dq_report/dq_report.html`.
+
+### Layer 5: Gold (curated)
+
+- **Dimensions** `dim_customer`, `dim_branch`, `dim_product`: SCD Type 2. Each has `*_sk`, `valid_from`, `valid_to`, `is_current`, and `row_hash`. A changed `row_hash` on an existing key closes the old version at the batch cutoff and opens a new one. An unchanged `row_hash` does nothing, so reruns are safe.
+- **Fact** `fact_transaction`: one row per `transaction_id`. A correction updates `amount` and `status` in place, so nothing is double-counted. Surrogate keys point to the dimension version valid at the transaction time (point-in-time).
+- **Format:** Parquet in folders, with microsecond timestamps so Athena can read them. Apache Iceberg (with `MERGE` and time travel) is the planned upgrade.
+
+### Layer 6: Serving and reconciliation
+
+- **Serving:** the 13 KPIs are Athena views over the Gold tables. The same SQL runs on DuckDB locally and produces identical results.
+- **Reconciliation per entity:** `raw rows = clean rows + rejected rows`. The batch fails if any entity's data-quality reject rate exceeds its threshold (25% placeholder, `MISSING_DIM` excluded).
+- **Planned:** control-total checks on amounts, key coverage, and warehouse parity (see the design doc).
+
+### Layer 7: Security and operations
+
+| Control | Status |
+|---|---|
+| KMS customer-managed key with rotation (prod) | Built |
+| S3 Object Lock on raw (prod) | Built |
+| TLS-only bucket policies, server access logs (prod) | Built |
+| Lambda, Glue, and Step Functions logs with retention (prod) | Built |
+| Alarms and failure alerts through SNS | Built |
+| Least-privilege IAM per job | Built (scoped roles) |
+| Lake Formation column masking for PII | Planned |
+| VPC endpoints for private traffic | Planned |
+| Macie scans on the raw bucket | Planned |
+
+Phone, email, DOB, and address are present in the customer data. The repo is private, and the quarantine files contain these fields.
 
 ---
 
-## 3. End-to-End Concrete Example: Tracing a Real Batch
+## 3. Worked Example: Real Rows From Day 2
 
-### Scenario:
-A morning incremental batch (`BATCH_101`) arrives containing:
-1. **Customer Record**: Customer `C_99` changes KYC status from `Pending` to `Verified`.
-2. **Transaction Record A**: Customer `C_99` executes a valid transaction of `₹5,000.00`.
-3. **Transaction Record B**: A corrupted transaction of `-₹999.00` referencing non-existent customer `C_404`.
+Three real records from the Day 2 batch show how the pipeline handles them.
 
-```mermaid
-sequenceDiagram
-    participant S3 as S3 Bronze
-    participant SF as Step Functions
-    participant G1 as Glue Stage 1 (Dims)
-    participant G2 as Glue Stage 2 (Facts)
-    participant QUAR as S3 Quarantine
-    participant GOLD as Gold Iceberg
-    participant RS as Redshift Serverless
+1. **KYC change, customer `C007`:** status changed from `Pending` to `Verified` on 2026-10-02.
+   Stage 1 compared the new `row_hash` with the stored one, closed the Pending version at the cutoff, and opened a new current version. Both versions are kept, which is how KPI 12 reports the transition.
+2. **Point-in-time link, transaction `T0741`:** account `A0007`, dated 2026-03-31, `SUCCESS`, 93,273. It predates the change, so Stage 2 links it to the Pending version of `C007`. A later report still shows the status that applied when the transaction happened.
+3. **Rejected row, transaction `T9084`:** amount `-112836` on account `A0053`. It fails the amount rule first and is quarantined as `AMOUNT_NEGATIVE`. It is not reported as a missing dimension, because the amount check runs before the referential check. It is kept in quarantine with its raw payload.
 
-    Note over S3: batch_101 lands: customers.csv, transactions.csv, manifest.json
-    S3->>SF: EventBridge & SQS invoke Step Functions
-    
-    rect rgb(230, 245, 230)
-    Note over SF,G1: Stage 1: Dimensions Execution
-    SF->>G1: Clean & Curate Customers
-    G1->>GOLD: C_99 existing row: valid_to = now, is_current = false
-    G1->>GOLD: C_99 new row inserted: KYC = 'Verified', is_current = true
-    end
+Reconciliation for the file: `raw = clean + rejected`, and the batch is marked `LOADED`.
 
-    rect rgb(230, 240, 255)
-    Note over SF,G2: Stage 2: Facts Execution
-    SF->>G2: Clean & Validate Transactions against Gold Dims
-    G2->>GOLD: Transaction A (₹5,000): C_99 exists in Gold -> MERGE INTO fact_transaction
-    G2->>QUAR: Transaction B (-₹999, C_404): Negative amount & Missing Dim -> Quarantine S3
-    end
+---
 
-    Note over SF,RS: Serving Load & Reconciliation
-    SF->>RS: Load Transaction A into Redshift DW & Refresh MVs
-    Note over SF: Reconcile Lambda: Ingested (2) = Silver (1) + Quarantine (1) [PASSED]
+## 4. KPIs
+
+| # | KPI |
+|---|---|
+| 1 | Top 5 customers by net transaction volume (refunds subtracted; ties broken by transaction count) |
+| 2 | Monthly volume per branch and region, with month-over-month % |
+| 3 | Product revenue, share of category, and period-over-period change |
+| 4 | Dormant accounts (no successful transaction in 90 days); `High-Risk Dormant` for Credit Card and Loan |
+| 5 | Suspicious transactions: amount over 100,000, three or more in 10 minutes, or between 00:00 and 05:00 |
+| 6 | RFM segments (Platinum, Gold, Silver, Bronze) from tertiles on recency, frequency, and value |
+| 7 | Branch ranking within region (`RANK` and `DENSE_RANK`; top and bottom performers) |
+| 8 | Value share by customer KYC status |
+| 9 | Refund count and value rate by product and branch |
+| 10 | Data-quality scorecard per file and batch, with top rejection reasons |
+| 11 | Day 2 reconciliation: new, updated, and corrected counts; KPI 1 and 7 deltas against Day 1 |
+| 12 | KYC transitions between Day 1 and Day 2 |
+| 13 | New account activations on Day 2 |
+
+Definitions and assumptions: successful INR transactions for value KPIs; all statuses for monitoring (KPI 5);
+non-INR amounts are flagged and excluded, not converted. SQL is in [sql/](sql/). Current results are in
+[kpi_output/](kpi_output/) (prod copy) and the dashboard in [dashboard/](dashboard/).
+
+---
+
+## 5. Repository layout
+
+| Path | Contents |
+|---|---|
+| `Retailbank_SourceData/` | Day 1 and Day 2 source files |
+| `pipeline/` | Cleansing, SCD2, fact upsert, batch orchestration, serving layer |
+| `sql/` | The 13 KPI definitions |
+| `deploy/` | CloudFormation templates (`template.yaml` dev, `template.prod.yaml` prod), deploy script, Glue runner, dashboard builder |
+| `tests/` | Unit tests for the cleansing rules, dedup, SCD2, and fact upsert (32 tests) |
+| `dq_report/` | Data-quality and reject report |
+| `dashboard/` | KPI dashboard generated from Athena |
+| `docs/` | Operations runbook and design defence |
+| `out/` | Local pipeline outputs (generated, not committed) |
+
+## 6. Running it
+
+```bash
+# Local
+python -m pytest tests -q
+python -m pipeline.run_local day1
+python -m pipeline.run_local day2
+
+# AWS (prod)
+python deploy/deploy.py --env prod stack
+python deploy/deploy.py --env prod package
+python deploy/deploy.py --env prod upload day1
+python deploy/deploy.py --env prod upload day2
+python deploy/deploy.py --env prod athena
+python deploy/build_dashboard.py --env prod
+```
+
+See [docs/runbook.md](docs/runbook.md) for prerequisites, the order of steps, cost notes, and known issues.
+
+## 7. Open items
+
+1. Confirm the 25% reject threshold per entity with the data owners.
+2. Confirm the retention mode (`GOVERNANCE` or `COMPLIANCE`) with compliance.
+3. Confirm day-first for ambiguous dates, and whether non-INR amounts should be converted.
+4. Confirm the KPI definitions where the brief is open (success-only rule, RFM cut-offs, dormant product rule).
+5. Decide on Iceberg (for `MERGE`) and Redshift Serverless (for BI concurrency) before production scale.
+6. Add the reconciliation invariants for control totals and key coverage.
