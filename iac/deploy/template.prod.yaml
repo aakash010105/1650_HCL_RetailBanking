@@ -30,7 +30,26 @@ Parameters:
     Default: 365
     AllowedValues: [90, 180, 365, 731, 1827, 2557]
 
+  DeployViews:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "true creates the Athena KPI views from sql/ in the artifacts bucket. Set after the SQL has been uploaded."
+  SqlVersion:
+    Type: String
+    Default: "none"
+    Description: Hash of the sql/ files. A change re-creates the views.
+  AsOfDate:
+    Type: String
+    Default: "2026-10-06"
+    Description: Pipeline run date used by the KPI SQL ({as_of}).
+  Day2Cutoff:
+    Type: String
+    Default: "2026-10-02 00:00:00"
+    Description: Day 2 cutoff used by the KPI SQL ({cutoff}).
+
 Conditions:
+  CreateViews: !Equals [!Ref DeployViews, "true"]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
 Resources:
@@ -1109,6 +1128,181 @@ Resources:
           EncryptionConfiguration:
             EncryptionOption: SSE_KMS
             KmsKey: !GetAtt DataKey.Arn
+
+  # ------------------------------------------------------------ Athena views (KPI layer, applied by the stack)
+  ViewsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateViews
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: create-athena-views
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution]
+                Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:CreateTable, glue:UpdateTable]
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${CatalogDatabase}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${CatalogDatabase}/*
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub ${ArtifactsBucket.Arn}/sql/*
+              - Effect: Allow
+                Action: [s3:GetBucketLocation, s3:GetObject, s3:ListBucket, s3:PutObject]
+                Resource:
+                  - !GetAtt LakeBucket.Arn
+                  - !Sub ${LakeBucket.Arn}/athena-results/*
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt DataKey.Arn
+
+  ViewsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateViews
+    Properties:
+      LogGroupName: !Sub /aws/lambda/retailbank-${Env}-athena-views
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt DataKey.Arn
+
+  ViewsFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateViews
+    DependsOn: ViewsLogGroup
+    Properties:
+      FunctionName: !Sub retailbank-${Env}-athena-views
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ViewsRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, re, time, urllib.request
+          import boto3
+
+          ath = boto3.client("athena")
+          s3 = boto3.client("s3")
+
+
+          def reply(event, status, reason="OK"):
+              body = json.dumps({"Status": status, "Reason": reason[:500],
+                                 "PhysicalResourceId": "retailbank-athena-views",
+                                 "StackId": event["StackId"], "RequestId": event["RequestId"],
+                                 "LogicalResourceId": event["LogicalResourceId"]}).encode()
+              urllib.request.urlopen(urllib.request.Request(event["ResponseURL"], data=body, method="PUT"), timeout=30)
+
+
+          def run(sql, db, wg):
+              qid = ath.start_query_execution(QueryString=sql, WorkGroup=wg,
+                                              QueryExecutionContext={"Catalog": "AwsDataCatalog", "Database": db})["QueryExecutionId"]
+              while True:
+                  st = ath.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+                  if st["State"] == "SUCCEEDED":
+                      return
+                  if st["State"] in ("FAILED", "CANCELLED"):
+                      raise RuntimeError(f"{st.get('StateChangeReason', st['State'])[:300]} | {sql[:120]}")
+                  time.sleep(1)
+
+
+          def qualify(sql, names, db):
+              text = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
+              for name in sorted(set(names), key=len, reverse=True):
+                  text = re.sub(r"(?<![\w.])" + name + r"(?!\w)", f"{db}.{name}", text)
+              return text
+
+
+          def handler(event, _):
+              try:
+                  if event["RequestType"] == "Delete":
+                      reply(event, "SUCCESS")
+                      return
+                  p = event["ResourceProperties"]
+                  db, wg = p["Database"], p["WorkGroup"]
+                  names = p["Tables"] + ["v_fact"] + p["Views"]
+                  bodies = {"v_fact": p["FactSql"]}
+                  for view in p["Views"]:
+                      key = f"sql/{view}.sql"
+                      bodies[view] = s3.get_object(Bucket=p["SqlBucket"], Key=key)["Body"].read().decode("utf-8")
+                  for name, sql in bodies.items():
+                      text = sql.strip().rstrip(";").replace("{as_of}", p["AsOf"]).replace("{cutoff}", p["Cutoff"])
+                      run(f"CREATE OR REPLACE VIEW {db}.{name} AS {qualify(text, names, db)}", db, wg)
+                  reply(event, "SUCCESS", f"{len(bodies)} views created")
+              except Exception as exc:
+                  reply(event, "FAILED", str(exc))
+
+  AthenaViews:
+    Type: Custom::AthenaViews
+    Condition: CreateViews
+    DependsOn:
+      - ViewsRole
+      - GoldFactTransactionTable
+      - GoldDimCustomerTable
+      - GoldDimBranchTable
+      - GoldDimProductTable
+      - ControlDqScorecardTable
+      - ServingBatchChangesTable
+      - ServingKpiSnapshotTable
+      - SilverTransactionsTable
+      - SilverCustomersTable
+      - SilverBranchesTable
+      - SilverProductsTable
+      - QuarantineTransactionsTable
+      - QuarantineCustomersTable
+      - QuarantineBranchesTable
+      - QuarantineProductsTable
+    Properties:
+      ServiceToken: !GetAtt ViewsFunction.Arn
+      Database: !Ref CatalogDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      SqlBucket: !Ref ArtifactsBucket
+      AsOf: !Ref AsOfDate
+      Cutoff: !Ref Day2Cutoff
+      SqlVersion: !Ref SqlVersion
+      Tables:
+        - fact_transaction
+        - dim_customer
+        - dim_branch
+        - dim_product
+        - dq_scorecard
+        - batch_changes
+        - kpi_snapshot
+        - silver_transactions
+        - silver_customers
+        - silver_branches
+        - silver_products
+        - quarantine_transactions
+        - quarantine_customers
+        - quarantine_branches
+        - quarantine_products
+      Views:
+        - kpi_01_top5_customers
+        - kpi_02_monthly_branch_trend
+        - kpi_03_product_revenue
+        - kpi_04_dormant_accounts
+        - kpi_05_suspicious_txns
+        - kpi_06_rfm_segments
+        - kpi_07_branch_rank_region
+        - kpi_08_kyc_risk_exposure
+        - kpi_09_refund_rate
+        - kpi_10_dq_scorecard
+        - kpi_11_day2_reconciliation
+        - kpi_12_kyc_transitions
+        - kpi_13_day2_activation
+      FactSql: |
+        SELECT transaction_id, account_id, product_id, branch_id, customer_sk, product_sk, branch_sk,
+               transaction_date, "timestamp" AS txn_ts, amount, status, currency, is_refund,
+               payment_method, is_correction, first_batch_id, loaded_batch_id
+        FROM fact_transaction
 
 Outputs:
   RawBucket:

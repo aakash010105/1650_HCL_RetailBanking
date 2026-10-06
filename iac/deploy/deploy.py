@@ -59,12 +59,24 @@ def run_aws(*args: str) -> str:
     return subprocess.run(["aws", *args, "--region", REGION], check=True, capture_output=True, text=True).stdout
 
 
+def sql_version() -> str:
+    """Hash of the KPI SQL files. A change makes the stack re-create the Athena views."""
+    digest = hashlib.sha256()
+    for sql_file in sorted((ROOT / "sql").glob("*.sql")):
+        digest.update(sql_file.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def cmd_stack():
     params = [f"Env={ENV}"]
     if ENV == "prod":
         # Optional alert address for prod. Set ALERT_EMAIL in the shell to subscribe it.
         import os
         params.append(f"AlertEmail={os.environ.get('ALERT_EMAIL', '')}")
+        # Views need the SQL in S3 first, so the first deploy runs without them.
+        # Run `package` once, then `stack --with-views`.
+        params.append(f"DeployViews={'true' if '--with-views' in sys.argv else 'false'}")
+        params.append(f"SqlVersion={sql_version()}")
     out = subprocess.run(
         ["aws", "cloudformation", "deploy", "--region", REGION, "--stack-name", STACK,
          "--template-file", str(ROOT / ENVIRONMENTS[ENV]),
@@ -86,6 +98,9 @@ def cmd_package():
             z.write(sql_file, f"sql/{sql_file.name}")
     s3.upload_file(str(zip_path), ARTIFACTS, "glue/pipeline.zip")
     s3.upload_file(str(ROOT / "deploy" / "glue" / "pipeline_runner.py"), ARTIFACTS, "glue/pipeline_runner.py")
+    # The stack's Athena views read these files from S3.
+    for sql_file in sorted((ROOT / "sql").glob("*.sql")):
+        s3.upload_file(str(sql_file), ARTIFACTS, f"sql/{sql_file.name}")
     print(f"uploaded pipeline.zip ({zip_path.stat().st_size} bytes) and pipeline_runner.py to {ARTIFACTS}")
 
 
@@ -155,6 +170,10 @@ def athena(sql: str, database: str | None = None) -> None:
 
 
 def cmd_athena():
+    if ENV == "prod":
+        # Prod views are owned by the CloudFormation stack (AthenaViews custom resource).
+        print("prod views are created by the stack: run `package`, then `stack --with-views`")
+        return
     athena(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
 
     tables = {
